@@ -1,53 +1,81 @@
 name: Notify renasoftware homepage
 
-# 릴리스를 발행/수정하면 renasoftware.com 의 NASA-95 다운로드(버전·날짜·링크·용량)를 자동 갱신한다.
-# 필요한 Secret: RELEASE_API_TOKEN (홈페이지 백엔드의 RELEASE_API_TOKEN 과 동일 값)
+# 정식 릴리스를 발행하면 renasoftware.co.kr 의 NASA-95 다운로드(버전·링크·용량)를 자동 갱신한다.
+# - 홈페이지에는 언제나 이 저장소의 "최신 정식 릴리스(Latest)"를 올린다. 개발 사전 릴리스는 올리지 않고,
+#   옛 릴리스를 고쳐도 홈페이지가 옛 버전으로 돌아가지 않는다.
+# - 릴리스가 먼저 만들어지고 파일이 뒤에 올라오므로 설치 파일과 ZIP 이 모두 올라올 때까지 기다린다.
+# - 수동 실행(workflow_dispatch)으로 지금의 최신 정식 릴리스를 다시 보낼 수 있다.
+# 필요한 Secret: RELEASE_API_TOKEN (홈페이지 백엔드의 RELEASE_API_TOKEN 과 같은 값)
 
 on:
   release:
     types: [published, edited]
+  workflow_dispatch:
+
+concurrency:
+  group: notify-homepage
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   update-homepage:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Update NASA-95 download on renasoftware.com
+      - name: Update NASA-95 download on renasoftware.co.kr
         env:
           TOKEN: ${{ secrets.RELEASE_API_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
-          NOTES_URL: ${{ github.event.release.html_url }}
-          ASSETS: ${{ toJSON(github.event.release.assets) }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           API: https://www.renasoftware.co.kr/api/products/nasa-95/release
         run: |
           set -euo pipefail
-          VER="${TAG#v}"   # v0.3.0 -> 0.3.0
-
-          # 릴리스 자산에서 NASA-95 설치 파일(.exe)과 포터블(.zip)만 골라 다운로드 배열 구성.
-          # 용량은 바이트 → MB(소수 1자리)로 표기. 설치 파일을 먼저 배치한다.
-          DOWNLOADS=$(printf '%s' "$ASSETS" | jq -c '
-            [ .[] | select(.name | test("^NASA-95-.*-setup\\.exe$")) ]
-            + [ .[] | select(.name | test("^NASA-95-.*-win64\\.zip$")) ]
-            | map({
-                label:    (if (.name | test("setup")) then "Windows 설치 파일" else "Windows 포터블 (ZIP)" end),
-                platform: "windows",
-                url:      .browser_download_url,
-                size:     (((.size / 1048576) * 10 | round / 10 | tostring) + " MB"),
-                note:     (if (.name | test("setup")) then "Windows x64 설치형" else "압축을 풀어 바로 실행" end)
-              })
-          ')
-
-          if [ "$(printf '%s' "$DOWNLOADS" | jq 'length')" -eq 0 ]; then
-            echo "NASA-95 자산을 찾지 못했습니다. 건너뜁니다."
-            exit 0
+          if [ -z "$TOKEN" ]; then
+            echo "::error::RELEASE_API_TOKEN 이 없습니다"
+            exit 1
           fi
+
+          # 최신 정식 릴리스의 NASA-95 설치 파일(.exe)과 포터블(.zip)이 모두 올라올 때까지 기다린다(최대 20분).
+          DOWNLOADS='[]'
+          for i in $(seq 1 60); do
+            RELEASE=$(gh api "repos/$REPO/releases/latest")
+            DOWNLOADS=$(printf '%s' "$RELEASE" | jq -c '
+              [ .assets[] | select(.state == "uploaded") ] as $a
+              | [ $a[] | select(.name | test("^NASA-95-.*-setup\\.exe$")) ]
+              + [ $a[] | select(.name | test("^NASA-95-.*-win64\\.zip$")) ]
+              | map({
+                  label:    (if (.name | test("setup")) then "Windows 설치 파일" else "Windows 포터블 (ZIP)" end),
+                  platform: "windows",
+                  url:      .browser_download_url,
+                  size:     (((.size / 1048576) * 10 | round / 10 | tostring) + " MB"),
+                  note:     (if (.name | test("setup")) then "Windows x64 설치형" else "압축을 풀어 바로 실행" end)
+                })
+            ')
+            if [ "$(printf '%s' "$DOWNLOADS" | jq 'length')" -ge 2 ]; then
+              break
+            fi
+            echo "릴리스 파일을 기다립니다 ($i/60)"
+            sleep 20
+          done
+          if [ "$(printf '%s' "$DOWNLOADS" | jq 'length')" -lt 2 ]; then
+            echo "::error::최신 릴리스에서 NASA-95 설치 파일과 ZIP 을 찾지 못했습니다"
+            exit 1
+          fi
+
+          TAG=$(printf '%s' "$RELEASE" | jq -r '.tag_name')
+          NOTES_URL=$(printf '%s' "$RELEASE" | jq -r '.html_url')
+          VER="${TAG#v}"   # v0.3.0 -> 0.3.0
 
           BODY=$(jq -cn --arg v "$VER" --arg n "$NOTES_URL" --argjson d "$DOWNLOADS" \
             '{version: $v, release_notes_url: $n, downloads: $d}')
           echo "payload: $BODY"
 
-          curl -fsS -X POST "$API" \
+          curl -fsS --retry 5 --retry-delay 10 --retry-all-errors -X POST "$API" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -d "$BODY"
           echo
-          echo "홈페이지 NASA-95 다운로드를 ${VER} 로 갱신했습니다."
+          echo "홈페이지 NASA-95 다운로드를 ${VER} 로 갱신했습니다." | tee -a "$GITHUB_STEP_SUMMARY"
