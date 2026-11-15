@@ -1,0 +1,53 @@
+name: Notify renasoftware homepage
+
+# 릴리스를 발행/수정하면 renasoftware.com 의 NASA-95 다운로드(버전·날짜·링크·용량)를 자동 갱신한다.
+# 필요한 Secret: RELEASE_API_TOKEN (홈페이지 백엔드의 RELEASE_API_TOKEN 과 동일 값)
+
+on:
+  release:
+    types: [published, edited]
+
+jobs:
+  update-homepage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update NASA-95 download on renasoftware.com
+        env:
+          TOKEN: ${{ secrets.RELEASE_API_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          NOTES_URL: ${{ github.event.release.html_url }}
+          ASSETS: ${{ toJSON(github.event.release.assets) }}
+          API: https://www.renasoftware.co.kr/api/products/nasa-95/release
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"   # v0.3.0 -> 0.3.0
+
+          # 릴리스 자산에서 NASA-95 설치 파일(.exe)과 포터블(.zip)만 골라 다운로드 배열 구성.
+          # 용량은 바이트 → MB(소수 1자리)로 표기. 설치 파일을 먼저 배치한다.
+          DOWNLOADS=$(printf '%s' "$ASSETS" | jq -c '
+            [ .[] | select(.name | test("^NASA-95-.*-setup\\.exe$")) ]
+            + [ .[] | select(.name | test("^NASA-95-.*-win64\\.zip$")) ]
+            | map({
+                label:    (if (.name | test("setup")) then "Windows 설치 파일" else "Windows 포터블 (ZIP)" end),
+                platform: "windows",
+                url:      .browser_download_url,
+                size:     (((.size / 1048576) * 10 | round / 10 | tostring) + " MB"),
+                note:     (if (.name | test("setup")) then "Windows x64 설치형" else "압축을 풀어 바로 실행" end)
+              })
+          ')
+
+          if [ "$(printf '%s' "$DOWNLOADS" | jq 'length')" -eq 0 ]; then
+            echo "NASA-95 자산을 찾지 못했습니다. 건너뜁니다."
+            exit 0
+          fi
+
+          BODY=$(jq -cn --arg v "$VER" --arg n "$NOTES_URL" --argjson d "$DOWNLOADS" \
+            '{version: $v, release_notes_url: $n, downloads: $d}')
+          echo "payload: $BODY"
+
+          curl -fsS -X POST "$API" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY"
+          echo
+          echo "홈페이지 NASA-95 다운로드를 ${VER} 로 갱신했습니다."
